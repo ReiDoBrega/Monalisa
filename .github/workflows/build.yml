@@ -1,0 +1,207 @@
+name: Build MonaLisa
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-native:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows AMD64
+          - os: windows-latest
+            platform: windows-amd64
+            goos: windows
+            goarch: amd64
+            ext: .exe
+          
+          # Linux AMD64
+          - os: ubuntu-latest
+            platform: linux-amd64
+            goos: linux
+            goarch: amd64
+            ext: ''
+          
+          # macOS AMD64 (Intel)
+          - os: macos-latest
+            platform: darwin-amd64
+            goos: darwin
+            goarch: amd64
+            ext: ''
+          
+          # macOS ARM64 (Apple Silicon)
+          - os: macos-latest
+            platform: darwin-arm64
+            goos: darwin
+            goarch: arm64
+            ext: ''
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+    
+    - name: Cache Go modules
+      uses: actions/cache@v4
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+    
+    - name: Download dependencies
+      run: go mod download
+    
+    - name: Install rsrc (Windows only)
+      if: runner.os == 'Windows'
+      run: go install github.com/akavel/rsrc@latest
+    
+    - name: Generate resource file (Windows only)
+      if: runner.os == 'Windows'
+      run: |
+        if (Test-Path "icon.ico") {
+          rsrc -ico icon.ico -o rsrc_windows_${{ matrix.goarch }}.syso
+          Write-Host "✓ Resource file generated successfully"
+        } else {
+          Write-Host "⚠ icon.ico not found, skipping resource generation"
+        }
+      shell: pwsh
+    
+    - name: Build
+      run: |
+        go build -v -ldflags="-s -w" -o monalisa-${{ matrix.platform }}${{ matrix.ext }}
+      env:
+        CGO_ENABLED: 1
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+    
+    - name: Test binary
+      if: |
+        (matrix.platform == 'linux-amd64') ||
+        (matrix.platform == 'darwin-amd64' && runner.arch == 'X64') ||
+        (matrix.platform == 'darwin-arm64' && runner.arch == 'ARM64')
+      run: ./monalisa-${{ matrix.platform }}${{ matrix.ext }} --help
+      continue-on-error: true
+    
+    - name: Test binary (Windows)
+      if: runner.os == 'Windows'
+      run: .\monalisa-${{ matrix.platform }}.exe --help
+      continue-on-error: true
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: monalisa-${{ matrix.platform }}
+        path: monalisa-${{ matrix.platform }}${{ matrix.ext }}
+        retention-days: 90
+
+  build-arm:
+    name: Build ARM ${{ matrix.platform }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux ARM64
+          - platform: linux-arm64
+            goos: linux
+            goarch: arm64
+            docker_arch: linux/arm64
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Build in Docker
+      run: |
+        docker run --rm --platform ${{ matrix.docker_arch }} \
+          -v $PWD:/workspace \
+          -w /workspace \
+          -e CGO_ENABLED=1 \
+          -e GOOS=${{ matrix.goos }} \
+          -e GOARCH=${{ matrix.goarch }} \
+          -e GOARM=${{ matrix.goarm }} \
+          golang:1.21 \
+          bash -c "
+            git config --global --add safe.directory /workspace
+            go mod download
+            go build -v -buildvcs=false -ldflags='-s -w' -o monalisa-${{ matrix.platform }}${{ matrix.ext || '' }}
+          "
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: monalisa-${{ matrix.platform }}
+        path: monalisa-${{ matrix.platform }}${{ matrix.ext || '' }}
+        retention-days: 90
+
+  release:
+    name: Create Release
+    needs: [build-native, build-arm]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    
+    - name: Display structure
+      run: ls -R artifacts
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: build-${{ github.run_number }}
+        name: Build #${{ github.run_number }} - ${{ github.sha }}
+        files: artifacts/**/*
+        draft: false
+        prerelease: false
+        body: |
+            ## 📦 Available Binaries
+            
+            **Build:** #${{ github.run_number }}
+            **Commit:** ${{ github.sha }}
+            **Branch:** ${{ github.ref_name }}
+            **Date:** ${{ github.event.head_commit.timestamp }}
+            
+            ### Windows
+            - `monalisa-windows-amd64.exe` - Windows 64-bit (Intel/AMD) with embedded icon
+            
+            ### Linux
+            - `monalisa-linux-amd64` - Linux 64-bit (Intel/AMD)
+            - `monalisa-linux-arm64` - Linux ARM64 (Raspberry Pi 4/5, AWS Graviton)
+            
+            ### macOS
+            - `monalisa-darwin-amd64` - macOS Intel
+            - `monalisa-darwin-arm64` - macOS Apple Silicon (M1/M2/M3/M4)
+            
+            ---
+            
+            ### 🚀 Getting Started
+            
+            1. Download the binary for your operating system
+            2. On Linux/macOS, make it executable: `chmod +x monalisa-*`
+            3. Run: `./monalisa-* --help`
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
